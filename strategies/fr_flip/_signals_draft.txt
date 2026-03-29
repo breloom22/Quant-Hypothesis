@@ -1,0 +1,660 @@
+```python
+import pandas as pd
+import numpy as np
+from typing import Callable, Dict, Optional, Union
+
+
+# ============================================================================
+# funding_rate_sign_change 변수 관련 함수들
+# ============================================================================
+
+def compute_funding_rate_sign_change_default(df: pd.DataFrame) -> pd.Series:
+    """
+    초기 구현: 가장 단순한 이진 분류. FR 부호 전환 시점 포착.
+    
+    Args:
+        df: funding_rate 컬럼이 포함된 DataFrame
+        
+    Returns:
+        pd.Series: 1(양수로 전환), -1(음수로 전환), 0(변화 없음)
+    """
+    if 'funding_rate' not in df.columns:
+        raise ValueError("DataFrame에 'funding_rate' 컬럼이 없습니다.")
+    
+    # 부호 계산 (양수: 1, 음수: -1, 0: 0)
+    fr_sign = np.sign(df['funding_rate'])
+    
+    # 부호 전환 감지 (이전 봉과 부호가 다를 때)
+    sign_change = (fr_sign != fr_sign.shift(1)).astype(int)
+    
+    # 방향성 부여 (양수로 전환: 1, 음수로 전환: -1)
+    signal = sign_change * fr_sign
+    
+    return signal
+
+
+def compute_funding_rate_sign_change_magnitude_threshold(
+    df: pd.DataFrame, 
+    threshold: float = 0.0001
+) -> pd.Series:
+    """
+    개선 후보: |FR|>0.01% 조건 추가, 0근처 노이즈 제거
+    
+    Args:
+        df: funding_rate 컬럼이 포함된 DataFrame
+        threshold: FR 크기 임계값 (기본값: 0.01% = 0.0001)
+        
+    Returns:
+        pd.Series: 1(양수로 전환), -1(음수로 전환), 0(변화 없음)
+    """
+    if 'funding_rate' not in df.columns:
+        raise ValueError("DataFrame에 'funding_rate' 컬럼이 없습니다.")
+    
+    fr = df['funding_rate']
+    fr_sign = np.sign(fr)
+    
+    # 임계값 조건: 현재 또는 이전 FR의 절대값이 임계값 이상
+    magnitude_condition = (fr.abs() >= threshold) | (fr.shift(1).abs() >= threshold)
+    
+    # 부호 전환 감지
+    sign_change = (fr_sign != fr_sign.shift(1)).astype(int)
+    
+    # 방향성 부여 및 임계값 조건 적용
+    signal = sign_change * fr_sign * magnitude_condition.astype(int)
+    
+    return signal
+
+
+def compute_funding_rate_sign_change_consecutive_confirmation(
+    df: pd.DataFrame, 
+    n_consecutive: int = 3
+) -> pd.Series:
+    """
+    개선 후보: n개 연속 동일 부호 후 전환 확정
+    
+    Args:
+        df: funding_rate 컬럼이 포함된 DataFrame
+        n_consecutive: 확인에 필요한 연속 봉 수
+        
+    Returns:
+        pd.Series: 1(양수로 전환), -1(음수로 전환), 0(변화 없음)
+    """
+    if 'funding_rate' not in df.columns:
+        raise ValueError("DataFrame에 'funding_rate' 컬럼이 없습니다.")
+    
+    fr = df['funding_rate']
+    fr_sign = np.sign(fr)
+    
+    # 연속 동일 부호 확인
+    sign_change = fr_sign != fr_sign.shift(1)
+    sign_group = (~sign_change).cumsum()
+    
+    # 각 그룹의 크기 계산
+    group_sizes = sign_group.groupby(sign_group).transform('size')
+    
+    # 이전 그룹이 n_consecutive 이상 지속되었는지 확인
+    prev_group_sizes = group_sizes.shift(1)
+    confirmed_change = (fr_sign != fr_sign.shift(1)) & (prev_group_sizes >= n_consecutive)
+    
+    # 방향성 부여
+    signal = confirmed_change.astype(int) * fr_sign
+    
+    return signal
+
+
+def compute_funding_rate_sign_change_zscore_normalization(
+    df: pd.DataFrame, 
+    window: int = 20,
+    zscore_threshold: float = 1.0
+) -> pd.Series:
+    """
+    개선 후보: Z-score 정규화로 상대적 극단 포착
+    
+    Args:
+        df: funding_rate 컬럼이 포함된 DataFrame
+        window: Z-score 계산을 위한 롤링 윈도우 크기
+        zscore_threshold: Z-score 임계값
+        
+    Returns:
+        pd.Series: 1(양수로 전환), -1(음수로 전환), 0(변화 없음)
+    """
+    if 'funding_rate' not in df.columns:
+        raise ValueError("DataFrame에 'funding_rate' 컬럼이 없습니다.")
+    
+    fr = df['funding_rate']
+    
+    # Z-score 계산
+    rolling_mean = fr.rolling(window=window, min_periods=1).mean()
+    rolling_std = fr.rolling(window=window, min_periods=1).std()
+    zscore = (fr - rolling_mean) / (rolling_std + 1e-8)  # 0으로 나누기 방지
+    
+    # Z-score 부호
+    zscore_sign = np.sign(zscore)
+    
+    # Z-score 임계값 조건
+    extreme_condition = zscore.abs() >= zscore_threshold
+    
+    # 부호 전환 감지
+    sign_change = (zscore_sign != zscore_sign.shift(1)).astype(int)
+    
+    # 방향성 부여 및 임계값 조건 적용
+    signal = sign_change * zscore_sign * extreme_condition.astype(int)
+    
+    return signal
+
+
+# ============================================================================
+# entry_timing 변수 관련 함수들
+# ============================================================================
+
+def compute_entry_timing_default(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
+    """
+    초기 구현: FR 부호 전환 확인된 8h봉 종가에 시장가 진입
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        signal: funding_rate_sign_change에서 생성된 신호
+        
+    Returns:
+        pd.Series: 1(롱 진입), -1(숏 진입), 0(진입 없음)
+    """
+    # 신호가 있는 봉의 종가에 진입
+    entry_signal = signal.copy()
+    return entry_signal
+
+
+def compute_entry_timing_next_open(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
+    """
+    개선 후보: 다음봉 시가 진입 (실현 가능성)
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        signal: funding_rate_sign_change에서 생성된 신호
+        
+    Returns:
+        pd.Series: 1(롱 진입), -1(숏 진입), 0(진입 없음)
+    """
+    # 신호를 한 봉 뒤로 이동 (다음 봉 시가 진입)
+    entry_signal = signal.shift(1)
+    return entry_signal
+
+
+def compute_entry_timing_pullback(
+    df: pd.DataFrame, 
+    signal: pd.Series,
+    pullback_pct: float = 1.0
+) -> pd.Series:
+    """
+    개선 후보: 전환 후 되돌림 시 진입
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        signal: funding_rate_sign_change에서 생성된 신호
+        pullback_pct: 되돌림 비율 (%)
+        
+    Returns:
+        pd.Series: 1(롱 진입), -1(숏 진입), 0(진입 없음)
+    """
+    if 'close' not in df.columns:
+        raise ValueError("DataFrame에 'close' 컬럼이 없습니다.")
+    
+    entry_signal = pd.Series(0, index=df.index)
+    
+    # 신호 발생 지점 찾기
+    signal_points = signal[signal != 0]
+    
+    for idx in signal_points.index:
+        signal_dir = signal_points[idx]
+        signal_idx = df.index.get_loc(idx)
+        
+        # 다음 5봉 동안 되돌림 확인
+        lookahead = min(5, len(df) - signal_idx - 1)
+        
+        for i in range(1, lookahead + 1):
+            current_idx = signal_idx + i
+            current_price = df.iloc[current_idx]['close']
+            signal_price = df.iloc[idx]['close']
+            
+            if signal_dir == 1:  # 롱 신호
+                # 되돌림: 현재 가격이 신호 가격보다 pullback_pct% 이상 하락
+                pullback = (signal_price - current_price) / signal_price * 100
+                if pullback >= pullback_pct:
+                    entry_signal.iloc[current_idx] = 1
+                    break
+            elif signal_dir == -1:  # 숏 신호
+                # 되돌림: 현재 가격이 신호 가격보다 pullback_pct% 이상 상승
+                pullback = (current_price - signal_price) / signal_price * 100
+                if pullback >= pullback_pct:
+                    entry_signal.iloc[current_idx] = -1
+                    break
+    
+    return entry_signal
+
+
+# ============================================================================
+# exit_condition 변수 관련 함수들
+# ============================================================================
+
+def compute_exit_condition_default(
+    df: pd.DataFrame, 
+    entry_signal: pd.Series,
+    hold_bars: int = 3,
+    stop_loss_pct: float = 2.0
+) -> pd.Series:
+    """
+    초기 구현: 고정 보유 3봉(24h) + SL -2%
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        entry_signal: entry_timing에서 생성된 진입 신호
+        hold_bars: 보유할 봉 수
+        stop_loss_pct: 손실 제한 비율 (%)
+        
+    Returns:
+        pd.Series: 1(롱 청산), -1(숏 청산), 0(청산 없음)
+    """
+    if 'close' not in df.columns:
+        raise ValueError("DataFrame에 'close' 컬럼이 없습니다.")
+    
+    exit_signal = pd.Series(0, index=df.index)
+    active_positions = []
+    
+    for i in range(len(df)):
+        current_idx = df.index[i]
+        
+        # 청산 조건 확인
+        positions_to_close = []
+        for pos in active_positions[:]:
+            entry_idx, entry_dir, entry_price = pos
+            
+            # 보유 기간 조건
+            bars_held = i - df.index.get_loc(entry_idx)
+            
+            # 손실 제한 조건
+            current_price = df.iloc[i]['close']
+            if entry_dir == 1:  # 롱 포지션
+                pct_change = (current_price - entry_price) / entry_price * 100
+                stop_loss_triggered = pct_change <= -stop_loss_pct
+            else:  # 숏 포지션
+                pct_change = (entry_price - current_price) / entry_price * 100
+                stop_loss_triggered = pct_change <= -stop_loss_pct
+            
+            # 청산 조건
+            if bars_held >= hold_bars or stop_loss_triggered:
+                exit_signal.iloc[i] = entry_dir  # 진입 방향과 반대로 청산
+                positions_to_close.append(pos)
+        
+        # 청산된 포지션 제거
+        for pos in positions_to_close:
+            active_positions.remove(pos)
+        
+        # 새로운 진입
+        if entry_signal.iloc[i] != 0:
+            entry_dir = entry_signal.iloc[i]
+            entry_price = df.iloc[i]['close']
+            active_positions.append((current_idx, entry_dir, entry_price))
+    
+    return exit_signal
+
+
+def compute_exit_condition_fr_reversal(
+    df: pd.DataFrame, 
+    entry_signal: pd.Series,
+    fr_signal: pd.Series
+) -> pd.Series:
+    """
+    개선 후보: FR 부호 재반전 시 청산
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        entry_signal: entry_timing에서 생성된 진입 신호
+        fr_signal: funding_rate_sign_change에서 생성된 신호
+        
+    Returns:
+        pd.Series: 1(롱 청산), -1(숏 청산), 0(청산 없음)
+    """
+    exit_signal = pd.Series(0, index=df.index)
+    active_positions = []
+    
+    for i in range(len(df)):
+        current_idx = df.index[i]
+        
+        # FR 반전 신호 확인
+        current_fr_signal = fr_signal.iloc[i]
+        
+        # 청산 조건 확인
+        positions_to_close = []
+        for pos in active_positions[:]:
+            entry_idx, entry_dir, _ = pos
+            
+            # FR 부호 재반전 조건
+            if entry_dir == 1 and current_fr_signal == -1:  # 롱 포지션, FR 음수로 전환
+                exit_signal.iloc[i] = 1
+                positions_to_close.append(pos)
+            elif entry_dir == -1 and current_fr_signal == 1:  # 숏 포지션, FR 양수로 전환
+                exit_signal.iloc[i] = -1
+                positions_to_close.append(pos)
+        
+        # 청산된 포지션 제거
+        for pos in positions_to_close:
+            active_positions.remove(pos)
+        
+        # 새로운 진입
+        if entry_signal.iloc[i] != 0:
+            entry_dir = entry_signal.iloc[i]
+            entry_price = df.iloc[i]['close'] if 'close' in df.columns else 0
+            active_positions.append((current_idx, entry_dir, entry_price))
+    
+    return exit_signal
+
+
+def compute_exit_condition_price_target(
+    df: pd.DataFrame, 
+    entry_signal: pd.Series,
+    target_pct: float = 5.0,
+    stop_loss_pct: float = 2.0
+) -> pd.Series:
+    """
+    개선 후보: +X% 도달 시 익절
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        entry_signal: entry_timing에서 생성된 진입 신호
+        target_pct: 목표 수익률 (%)
+        stop_loss_pct: 손실 제한 비율 (%)
+        
+    Returns:
+        pd.Series: 1(롱 청산), -1(숏 청산), 0(청산 없음)
+    """
+    if 'close' not in df.columns:
+        raise ValueError("DataFrame에 'close' 컬럼이 없습니다.")
+    
+    exit_signal = pd.Series(0, index=df.index)
+    active_positions = []
+    
+    for i in range(len(df)):
+        current_idx = df.index[i]
+        
+        # 청산 조건 확인
+        positions_to_close = []
+        for pos in active_positions[:]:
+            entry_idx, entry_dir, entry_price = pos
+            
+            current_price = df.iloc[i]['close']
+            
+            if entry_dir == 1:  # 롱 포지션
+                pct_change = (current_price - entry_price) / entry_price * 100
+                target_reached = pct_change >= target_pct
+                stop_loss_triggered = pct_change <= -stop_loss_pct
+            else:  # 숏 포지션
+                pct_change = (entry_price - current_price) / entry_price * 100
+                target_reached = pct_change >= target_pct
+                stop_loss_triggered = pct_change <= -stop_loss_pct
+            
+            # 청산 조건
+            if target_reached or stop_loss_triggered:
+                exit_signal.iloc[i] = entry_dir  # 진입 방향과 반대로 청산
+                positions_to_close.append(pos)
+        
+        # 청산된 포지션 제거
+        for pos in positions_to_close:
+            active_positions.remove(pos)
+        
+        # 새로운 진입
+        if entry_signal.iloc[i] != 0:
+            entry_dir = entry_signal.iloc[i]
+            entry_price = df.iloc[i]['close']
+            active_positions.append((current_idx, entry_dir, entry_price))
+    
+    return exit_signal
+
+
+def compute_exit_condition_trailing_stop(
+    df: pd.DataFrame, 
+    entry_signal: pd.Series,
+    trail_pct: float = 3.0
+) -> pd.Series:
+    """
+    개선 후보: 고점/저점 대비 -X% 이격 시 청산
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        entry_signal: entry_timing에서 생성된 진입 신호
+        trail_pct: 트레일링 스탑 비율 (%)
+        
+    Returns:
+        pd.Series: 1(롱 청산), -1(숏 청산), 0(청산 없음)
+    """
+    if 'high' not in df.columns or 'low' not in df.columns:
+        raise ValueError("DataFrame에 'high' 및 'low' 컬럼이 필요합니다.")
+    
+    exit_signal = pd.Series(0, index=df.index)
+    active_positions = []
+    
+    for i in range(len(df)):
+        current_idx = df.index[i]
+        
+        # 청산 조건 확인
+        positions_to_close = []
+        for pos_idx, pos in enumerate(active_positions[:]):
+            entry_idx, entry_dir, entry_price, highest_high, lowest_low = pos
+            
+            current_high = df.iloc[i]['high']
+            current_low = df.iloc[i]['low']
+            current_close = df.iloc[i]['close']
+            
+            # 최고가/최저가 업데이트
+            if entry_dir == 1:  # 롱 포지션
+                highest_high = max(highest_high, current_high)
+                trail_level = highest_high * (1 - trail_pct / 100)
+                should_exit = current_close <= trail_level
+            else:  # 숏 포지션
+                lowest_low = min(lowest_low, current_low)
+                trail_level = lowest_low * (1 + trail_pct / 100)
+                should_exit = current_close >= trail_level
+            
+            # 포지션 정보 업데이트
+            active_positions[pos_idx] = (entry_idx, entry_dir, entry_price, highest_high, lowest_low)
+            
+            # 청산 조건
+            if should_exit:
+                exit_signal.iloc[i] = entry_dir  # 진입 방향과 반대로 청산
+                positions_to_close.append(pos)
+        
+        # 청산된 포지션 제거
+        for pos in positions_to_close:
+            active_positions.remove(pos)
+        
+        # 새로운 진입
+        if entry_signal.iloc[i] != 0:
+            entry_dir = entry_signal.iloc[i]
+            entry_price = df.iloc[i]['close']
+            current_high = df.iloc[i]['high']
+            current_low = df.iloc[i]['low']
+            
+            if entry_dir == 1:  # 롱 포지션
+                active_positions.append((current_idx, entry_dir, entry_price, current_high, current_low))
+            else:  # 숏 포지션
+                active_positions.append((current_idx, entry_dir, entry_price, current_high, current_low))
+    
+    return exit_signal
+
+
+# ============================================================================
+# position_sizing 변수 관련 함수들
+# ============================================================================
+
+def compute_position_sizing_default(
+    df: pd.DataFrame, 
+    entry_signal: pd.Series,
+    capital_pct: float = 0.1,
+    leverage: float = 1.0
+) -> pd.Series:
+    """
+    초기 구현: 고정 비율 10%, 레버리지 1x
+    
+    Args:
+        df: OHLCV 데이터가 포함된 DataFrame
+        entry_signal: entry_timing에서 생성된 진입 신호
+        capital_pct: 사용할 자본 비율
+        leverage: 레버리지 배수
+        
+    Returns:
+        pd.Series: 포지션 크기 (양수: 롱, 음수: 숏, 0: 포지션 없음)
+    """
+    position_size = entry_signal.copy() * capital_pct * leverage
+    return position_size
+
+
+def compute_position_sizing_fr_magnitude_scaling(
+    df: pd.DataFrame, 
+    entry_signal: pd.Series,
+    base_capital_pct: float = 0.1,
+    leverage: float = 1.0,
+    scaling_factor: float = 10.0
+) -> pd.Series:
+    """
+    개선 후보: |FR| 크기 비례 포지션
+    
+    Args:
+        df: funding_rate 컬럼이 포함된 DataFrame
+        entry_signal: entry_timing에서 생성된 진입 신호
+        base_capital_pct: 기본 자본 비율
+        leverage: 레버리지 배수
+        scaling_factor: FR 크기 스케일링 계수
+        
+    Returns:
+        pd.Series: 포지션 크기 (양수: 롱, 음수: 숏, 0: 포지션 없음)
+    """
+    if 'funding_rate' not in df.columns:
+        raise ValueError("DataFrame에 'funding_rate' 컬럼이 없습니다.")
+    
+    # FR 절대값 기반 스케일링
+    fr_magnitude = df['funding_rate'].abs()
+    
+    # 정규화된 스케일링 팩터 (0.01% = 1x, 0.1% = 10x 등)
+    normalized_scaling = 1 + (fr_magnitude * scaling_factor * 10000)  # 0.01% 단위로 스케일링
+    
+    # 포지션 크기 계산
+    position_size = entry_signal.copy() * base_capital_pct * leverage * normalized_scaling
+    
+    # 최대 100% 제한
+    position_size = position_size.clip(-1.0, 1.0)
+    
+    return position_size
+
+
+# ============================================================================
+# 통합 신호 생성 함수
+# ============================================================================
+
+def generate_signals(df: pd.DataFrame, overrides: Optional[Dict[str, Callable]] = None) -> pd.Series:
+    """
+    fr_flip 전략의 통합 신호 생성 함수
+    
+    Args:
+        df: funding_rate 컬럼이 포함된 OHLCV DataFrame
+        overrides: 특정 변수 계산 함수를 교체하기 위한 딕셔너리
+        
+    Returns:
+        pd.Series: 최종 트레이딩 신호 (1=롱, -1=숏, 0=플랫)
+    """
+    overrides = overrides or {}
+    
+    # 1. funding_rate_sign_change 계산
+    fr_signal_func = overrides.get(
+        'funding_rate_sign_change', 
+        compute_funding_rate_sign_change_default
+    )
+    fr_signal = fr_signal_func(df)
+    
+    # 2. entry_timing 계산
+    entry_timing_func = overrides.get(
+        'entry_timing',
+        compute_entry_timing_default
+    )
+    entry_signal = entry_timing_func(df, fr_signal)
+    
+    # 3. exit_condition 계산
+    exit_condition_func = overrides.get(
+        'exit_condition',
+        lambda d, e: compute_exit_condition_default(d, e, hold_bars=3, stop_loss_pct=2.0)
+    )
+    exit_signal = exit_condition_func(df, entry_signal)
+    
+    # 4. position_sizing 계산 (최종 신호에는 영향 없음, 참고용)
+    position_sizing_func = overrides.get(
+        'position_sizing',
+        lambda d, e: compute_position_sizing_default(d, e, capital_pct=0.1, leverage=1.0)
+    )
+    position_size = position_sizing_func(df, entry_signal)
+    
+    # 5. 최종 신호 조합 (진입 - 청산)
+    final_signal = pd.Series(0, index=df.index)
+    
+    # 포지션 상태 추적
+    current_position = 0
+    
+    for i in range(len(df)):
+        # 청산 신호 처리
+        if exit_signal.iloc[i] != 0:
+            if (current_position == 1 and exit_signal.iloc[i] == 1) or \
+               (current_position == -1 and exit_signal.iloc[i] == -1):
+                final_signal.iloc[i] = 0
+                current_position = 0
+        
+        # 진입 신호 처리 (현재 포지션이 없을 때만)
+        if entry_signal.iloc[i] != 0 and current_position == 0:
+            final_signal.iloc[i] = entry_signal.iloc[i]
+            current_position = entry_signal.iloc[i]
+    
+    return final_signal
+
+
+# ============================================================================
+# 유틸리티 함수
+# ============================================================================
+
+def get_all_overrides() -> Dict[str, Dict[str, Callable]]:
+    """
+    모든 개선 후보 함수를 포함하는 오버라이드 딕셔너리 반환
+    
+    Returns:
+        Dict: 변수별 개선 후보 함수 딕셔너리
+    """
+    return {
+        'funding_rate_sign_change': {
+            'magnitude_threshold': compute_funding_rate_sign_change_magnitude_threshold,
+            'consecutive_confirmation': compute_funding_rate_sign_change_consecutive_confirmation,
+            'zscore_normalization': compute_funding_rate_sign_change_zscore_normalization,
+        },
+        'entry_timing': {
+            'next_open': compute_entry_timing_next_open,
+            'pullback': compute_entry_timing_pullback,
+        },
+        'exit_condition': {
+            'fr_reversal': compute_exit_condition_fr_reversal,
+            'price_target': compute_exit_condition_price_target,
+            'trailing_stop': compute_exit_condition_trailing_stop,
+        },
+        'position_sizing': {
+            'fr_magnitude_scaling': compute_position_sizing_fr_magnitude_scaling,
+        }
+    }
+
+
+def create_custom_overrides(**kwargs) -> Dict[str, Callable]:
+    """
+    사용자 정의 오버라이드 생성
+    
+    Examples:
+        create_custom_overrides(
+            funding_rate_sign_change=compute_funding_rate_sign_change_magnitude_threshold,
+            entry_timing=compute_entry_timing_next_open
+        )
+    
+    Returns:
+        Dict: 사용자 정의 오버라이드 딕셔너리
+    """
+    return kwargs
+```

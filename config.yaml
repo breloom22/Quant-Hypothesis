@@ -1,0 +1,26 @@
+llm:
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-6"
+    max_tokens: 16384
+  deepseek:
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+    base_url: "https://api.deepseek.com"
+    max_tokens: 8192
+
+defaults:
+  backtest:
+    initial_capital: 10000
+    fee_rate: 0.0004
+    slippage: 0.0001
+  validation:
+    monte_carlo_sims: 10000
+    walk_forward_folds: 3
+    min_mc_p_value: 0.05
+    min_wf_pass_ratio: 0.67
+    min_signal_count: 50
+  data:
+    cache_dir: "data/cache"
+    cache_ttl_hours: 24
+    default_exchange: "binanceusdm"

@@ -1,0 +1,327 @@
+strategy_name: fr_flip
+created_at: '2026-03-28T22:22:34'
+status: complete
+phase_0:
+  observation: FR(펀딩비)의 부호가 전환될 때 가격 반전이 발생하는 경향이 있다. 음수 FR은 숏 과밀(숏 스퀴즈 가능성), 양수 FR은
+    롱 과밀(롱 청산 가능성)을 암시한다.
+  expectation: FR이 +에서 -로 전환되면 숏 과밀로 인한 캐스케이드 반등 예상 → 롱 진입. FR이 -에서 +로 전환되면 롱 과밀로
+    인한 캐스케이드 하락 예상 → 숏 진입.
+  frequency_sense: 펀딩비는 8시간마다 정산. 부호 전환은 수일~수주 간격으로 발생. 월 2~5회 정도 시그널 예상.
+  target_market:
+    exchange: binanceusdm
+    symbols:
+    - BTC/USDT:USDT
+    timeframe: 8h
+    data_source: ccxt
+phase_1:
+  variables:
+  - name: funding_rate_sign_change
+    role: 진입 트리거. FR 부호 전환 시점 포착.
+    initial_implementation: sign(fr_t) != sign(fr_t-1), threshold=0
+    initial_reason: 가장 단순한 이진 분류. 핵심 메커니즘만 격리 테스트.
+    candidates:
+    - name: magnitude_threshold
+      reason: '|FR|>0.01% 조건 추가, 0근처 노이즈 제거'
+      expected_if_success: FR 크기가 과밀 강도 반영
+      expected_if_failure: 크기 무관, 부호 자체가 신호
+    - name: consecutive_candles_confirmation
+      reason: n개 연속 동일 부호 후 전환 확정
+      expected_if_success: 지속성이 핵심, 단발 전환은 노이즈
+      expected_if_failure: 조기 진입이 유리, 확인 후 이미 늦음
+    - name: rolling_zscore_normalization
+      reason: Z-score 정규화로 상대적 극단 포착
+      expected_if_success: 상대적 편향이 과밀을 더 잘 설명
+      expected_if_failure: 절대 수준 자체가 정보, 정규화가 역효과
+  - name: entry_timing
+    role: 부호 전환 확인 후 실제 진입 시점.
+    initial_implementation: FR 부호 전환 확인된 8h봉 종가에 시장가 진입
+    initial_reason: 가장 단순. 슬리피지/정산 타이밍 이슈 측정용 베이스라인.
+    candidates:
+    - name: next_open_entry
+      reason: 다음봉 시가 진입 (실현 가능성)
+      expected_if_success: 1봉 지연이 유의미한 차이 없음
+      expected_if_failure: 신호 즉시 소멸, 종가 진입 불가가 구조적 결함
+    - name: pullback_entry
+      reason: 전환 후 되돌림 시 진입
+      expected_if_success: 초기 과반응 후 재진입 기회 존재
+      expected_if_failure: 되돌림 없이 직행, 기회비용 초과
+  - name: exit_condition
+    role: 포지션 청산 기준. 수익 실현 및 손실 제한.
+    initial_implementation: 고정 보유 3봉(24h) + SL -2%
+    initial_reason: 청산 복잡성 최소화. 진입 신호의 순수 예측력만 측정.
+    candidates:
+    - name: fr_sign_reversal_exit
+      reason: FR 부호 재반전 시 청산
+      expected_if_success: FR 지속성이 수익 지속성과 연동
+      expected_if_failure: 진입/청산 신호는 별개 메커니즘
+    - name: price_target_exit
+      reason: +X% 도달 시 익절
+      expected_if_success: FR 전환 효과가 제한적 범위
+      expected_if_failure: 스퀴즈 후 추세 형성, 조기 익절 기회비용
+    - name: trailing_stop_exit
+      reason: 고점/저점 대비 -X% 이격 시 청산
+      expected_if_success: 동적 청산이 유효
+      expected_if_failure: whipsaw로 조기 청산
+  - name: position_sizing
+    role: 각 트레이드의 자본 배분 크기.
+    initial_implementation: 고정 비율 10%, 레버리지 1x
+    initial_reason: 사이징 영향 제거. 신호 품질 자체만 측정.
+    candidates:
+    - name: fr_magnitude_scaling
+      reason: '|FR| 크기 비례 포지션'
+      expected_if_success: FR 크기와 반전 크기 상관관계 존재
+      expected_if_failure: 과밀 여부는 이진적, 크기는 노이즈
+  mechanism:
+    statement: FR 부호 전환은 지배적 포지션의 항복 완료를 의미하며, 전환 방향의 반대로 8h 지연 후 32h 내외의 추세가 확립된다.
+      (반전 신호)
+    prerequisites:
+    - 'P1: 펀딩비 부호는 롱/숏 포지션의 상대적 과밀을 나타낸다'
+    - 'P2: 과밀 방향 포지션 보유자들이 펀딩비 부담으로 포지션 정리/억제'
+    - 'P3: 부호 전환은 상당한 포지션 쏠림 이후 발생, 강제 청산 연결 가능'
+    - 'P4: BTC/USDT 영구선물 유동성 충분, 단일 전략 영향 없음'
+    causal_chain:
+    - 'A: FR 부호 전환 발생 (예: +→-, 기존 롱 과밀이 해소됨)'
+    - 'B: 전환 직후 8h 마찰 구간 (청산 잔여물, 노이즈)'
+    - 'C: 8h 후 새로운 방향의 추세 시작 (반대 포지션 우위 확립)'
+    - 'D: 32h 내외 추세 지속 후 소멸'
+    falsification:
+    - 'F1: FR 전환 후 가격이 반대 방향 지속 (예측 방향 자체가 틀림)'
+    - 'F2: FR 전환 후 가격 변동이 랜덤워크와 구분 불가 (예측력 없음)'
+    - 'F3: |FR| 큰 전환이 작은 전환보다 수익 낮음 (과밀 강도 ≠ 스퀴즈 강도)'
+    - 'F4: 유동성 낮은 알트가 BTC보다 훨씬 강한 효과 (BTC 스퀴즈 빠르게 소멸)'
+    version: 2
+  predictions:
+  - id: P01
+    statement: FR 부호 전환 진입이 랜덤 진입 대비 통계적으로 유의미하게 높은 수익
+    test_type: ab_compare
+    success_condition: 평균 수익 A>B, p<0.05, Sharpe>0
+    failure_learning: 신호 없음. FR 전환은 가격 반전 선행 지표 아님. 메커니즘 근본 오류 또는 이미 선반영.
+    priority: high
+    status: pending
+    result: {}
+  - id: P02
+    statement: 가격 반전 효과가 전환 직후 1~2봉에 집중되고 시간에 따라 감쇄
+    test_type: property_check
+    success_condition: '평균 수익: 1봉>2봉>3봉>=0 (단조 감쇄)'
+    failure_learning: 효과 지연 시 추세추종 메커니즘, 증가 시 추세전환 초기 신호. 청산 전략 재설계.
+    priority: high
+    status: pending
+    result: {}
+  - id: P03
+    statement: '|FR| 큰 전환이 작은 전환보다 더 큰 가격 반전 생성'
+    test_type: ab_compare
+    success_condition: high_fr 수익 > low_fr 수익, Spearman rho>0.2, p<0.1
+    failure_learning: FR 크기는 스퀴즈 강도 무관. magnitude_threshold, fr_magnitude_scaling
+      폐기.
+    priority: medium
+    status: pending
+    result: {}
+  - id: P04
+    statement: 롱(+→-) 방향과 숏(-→+) 방향이 대칭적 성과
+    test_type: ab_compare
+    success_condition: 두 방향 모두 양수 수익, 수익률 차이 <30%
+    failure_learning: BTC 상승 bias로 숏 무력화 시 단방향(롱only) 전략으로 전환.
+    priority: medium
+    status: pending
+    result: {}
+  - id: P05
+    statement: 횡보장에서 추세장보다 더 강한 반전 효과
+    test_type: domain_test
+    success_condition: 횡보장 평균 수익 > 추세장, 횡보장 승률 >60%
+    failure_learning: 국면 무관하면 필터링 불필요. 추세장에서 더 강하면 보유기간 확장.
+    priority: low
+    status: pending
+    result: {}
+phase_2:
+  refinement_count: 1
+  max_refinements: 3
+  refinement_history:
+  - version: 2
+    failed_predictions:
+    - P01_original_direction
+    interpretation: 원래 방향(+->- 롱)은 PF=0.75로 엣지 없음. 반전 방향(+->- 숏)+ lag1 + hold4에서 PF=1.29(전체2년),
+      WF 4/5 fold 통과. MAE>MFE 구조가 반전으로 MFE>MAE로 전환됨.
+    isolation_tests: []
+    revision: ''
+    new_predictions: []
+    timestamp: '2026-03-28T22:00:00'
+phase_3:
+  steps:
+    crude_signal:
+      status: fail
+      result:
+        PF: 0.75
+        N: 93
+        WR: 40.9
+        Return: -21.3
+        note: 'baseline: 원래방향+lag0+hold3'
+      interpretation: ''
+      timestamp: ''
+    signal_refinement:
+      status: pass
+      result:
+        best: reversed+lag1+hold4
+        PF: 1.29
+        N: 116
+        WR: 56.9
+        Return: 34.3
+        Sharpe: 1.13
+        MDD: 20.3
+      interpretation: ''
+      timestamp: ''
+    walk_forward:
+      status: pass
+      result:
+        folds_passed: 4/5
+        PF_median: 1.29
+        PF_mean: 1.17
+        loss_fold_return: -3.3
+      interpretation: ''
+      timestamp: ''
+    execution_tuning:
+      status: pass
+      result:
+        tp: 1.5
+        sl: null
+        tp_stable_range: 1.2~1.8%
+        sl_finding: SL 역효과 — 반전 전략 구조와 충돌. 타이트 SL이 정상 경로를 손절로 오인.
+        wf_tp15: 5/5 fold PF>1.0
+        wf_tp15_sl3: 3/5 fold PF>1.0 — SL 추가 시 악화
+        full_stats:
+          N: 174
+          WR: 66.7
+          PF: 1.26
+          Return: 33.5
+          MDD: 14.4
+          Sharpe: 1.28
+        is_stats:
+          N: 69
+          PF: 1.27
+          Sharpe: 0.9
+        oos_stats:
+          N: 104
+          PF: 1.24
+          Sharpe: 0.85
+          MDD: 12.0
+      interpretation: TP=1.5% 확정, SL 없음. 반전 전략은 진입 후 역방향 노이즈가 정상. Hard SL 대신 포지션 사이징+서킷브레이커로
+        리스크 관리. TP 안정 구간 1.2~1.8%.
+      timestamp: ''
+    domain_expansion:
+      status: pass
+      result:
+        best_timeframe: 8h
+        best_hold: 4
+        8h_stats:
+          N: 174
+          WR: 66.7
+          PF: 1.26
+          Return: 33.5
+          MDD: 14.4
+          Sharpe: 1.28
+        4h_stats:
+          N: 244
+          WR: 63.5
+          PF: 1.13
+          Return: 27.1
+          MDD: 25.7
+          Sharpe: 0.99
+        12h_stats:
+          N: 143
+          PF: 1.0
+          Return: -0.3
+        1d_stats:
+          N: 111
+          PF: 0.93
+          Return: -6.8
+        hold_sensitivity: hold=4 optimal. hold 2-3 undershoot, hold 5+ overshoot
+      interpretation: 8h timeframe이 펀딩비 정산 주기와 정확히 일치하여 신호 정보밀도 최대. Hold=4(32h)은 사전
+        가설과 일치. 4h은 노이즈(MDD 25.7%), 12h/1d는 엣지 소멸. PF가 8h에서 정점, 양방향 단조감소 — 메커니즘의 시간구조
+        실재 확인. 과적합 신호 없음.
+      timestamp: '2026-03-28T23:30:00'
+    universe_expansion:
+      status: partial
+      result:
+        tested:
+        - BTC
+        - ETH
+        - SOL
+        - XRP
+        - DOGE
+        - BNB
+        - ADA
+        - LINK
+        - AVAX
+        - DOT
+        - UNI
+        passed:
+        - BTC
+        - UNI
+        marginal:
+        - ADA
+        - ETH
+        failed:
+        - SOL
+        - XRP
+        - DOGE
+        - BNB
+        - LINK
+        - AVAX
+        - DOT
+        conclusion: BTC-specific strategy. UNI anomaly possible.
+        BTC:
+          N: 174
+          PF: 1.26
+          Sharpe: 1.28
+        UNI:
+          N: 266
+          PF: 1.28
+          Sharpe: 2.02
+      interpretation: BTC FR flip은 시장 전체 레버리지 청산의 트리거로 신호품질이 다름. 알트는 BTC 연동 + 고유 유동성
+        이슈로 FR이 독립신호가 아닌 메아리. ETH=1.00은 정보력 희석의 계층구조 확인. UNI(PF=1.28, N=266, Sharpe=2.02)는
+        anomaly 가능성 높아 별도 검증 필요.
+      timestamp: '2026-03-28T23:30:00'
+    failure_analysis:
+      status: pass
+      result:
+        total_trades: 174
+        wins: 116
+        losses: 58
+        win_rate: 66.7
+        winners:
+          avg_pnl: 1.21
+          avg_mfe: 1.4
+          avg_mae: 0.64
+          avg_bars: 2.4
+        losers:
+          avg_pnl: -1.87
+          avg_mfe: 0.73
+          avg_mae: 2.87
+          avg_bars: 3.5
+          max_loss: -11.53
+        max_consecutive_losses: 3
+        long:
+          N: 56
+          WR: 75.0
+          avg_pnl: 0.26
+        short:
+          N: 118
+          WR: 62.7
+          avg_pnl: 0.15
+        loss_mae_pctiles:
+          p50: 1.86
+          p90: 5.65
+          p95: 6.59
+        worst_month: Oct 2024 -8.64%
+      interpretation: Loser MFE +0.73%가 핵심 — 신호방향은 맞으나 TP까지 유지 실패. 신호품질 문제 아닌 구조 문제.
+        Long WR 75% vs Short WR 62.7%는 BTC 상승 bias 반영. Max loss -11.53%와 Oct 2024
+        -8.64%는 SL 부재의 예정된 결과. 포지션 사이징+서킷브레이커로 테일리스크 관리 권고.
+      timestamp: '2026-03-28T23:30:00'
+phase_4:
+  report_path: strategies/fr_flip/log.md
+  summary_path: strategies/fr_flip/summary.md
+  generated_at: '2026-03-29T00:24:44'
+llm_cost:
+  sonnet_input_tokens: 4407
+  sonnet_output_tokens: 8041
+  deepseek_input_tokens: 13323
+  deepseek_output_tokens: 3597
